@@ -14,6 +14,11 @@ st.markdown("Automated 3D rendering pipeline powered by Gemini & Manim Engine.")
 # Sidebar Settings
 st.sidebar.header("⚙️ Configuration")
 api_key = st.sidebar.text_input("Gemini API Key:", type="password")
+model_name = st.sidebar.selectbox(
+    "Gemini model",
+    ["gemini-2.5-flash", "gemini-2.5-pro"],
+    help="Flash = faster/cheaper. Pro = slightly more accurate on dense/cramped pages.",
+)
 quality = st.sidebar.selectbox("Render Quality", ["Low (-ql, Fast)", "Medium (-qm)", "High (-qh, 1080p)"])
 quality_flag = "-ql" if "Low" in quality else ("-qm" if "Medium" in quality else "-qh")
 
