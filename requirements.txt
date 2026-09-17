@@ -4,3 +4,6 @@ google-genai
 pillow
 pdfplumber
 pymupdf
+# AI providers -- install whichever you plan to use (at least one required)
+groq           # for Groq
+openai         # for OpenAI 
