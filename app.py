@@ -47,6 +47,15 @@ CRITICAL CODE REQUIREMENTS:
 4. Set up camera positions: `self.set_camera_orientation(phi=75 * DEGREES, theta=30 * DEGREES)`.
 5. Keep animations under 10 seconds.
 6. Start output directly with `from manim import *`.
+
+IMPORTANT MANIM CODE RULES:
+1. Do NOT use MathTex() or Tex(). They require full LaTeX binaries that may fail on cloud servers.
+2. ALWAYS use Text() for axis labels, titles, and annotations.
+   Example:
+   Incorrect: MathTex(r"$x$") or MathTex("x")
+   Correct: Text("x")
+3. For axis labels, pass pure strings or Text objects:
+   axes.get_axis_labels(x_label=Text("x"), y_label=Text("y"), z_label=Text("z"))
 """
 
 def sanitize_code(raw_text):
