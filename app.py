@@ -75,7 +75,7 @@ model_name = st.sidebar.selectbox(
 quality = st.sidebar.selectbox("Render Quality", ["Low (-ql, fast draft)", "Medium (-qm)", "High (-qh, 1080p60)"])
 quality_flag = "-ql" if "Low" in quality else ("-qm" if "Medium" in quality else "-qh")
 
-target_duration = st.sidebar.slider("Target total duration (seconds)", 20, 120, 45, step=5)
+target_duration = st.sidebar.slider("Target total duration (seconds)", 0, 120, 45, step=5)
 style_theme = st.sidebar.selectbox(
     "Visual theme",
     ["Deep Space (navy/cyan glow)", "Blueprint (dark slate/amber)", "Aurora (violet/teal gradient)"],
