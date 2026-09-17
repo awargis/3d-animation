@@ -2,3 +2,5 @@ streamlit
 manim
 google-genai
 pillow
+pdfplumber
+pymupdf
