@@ -1,46 +1,59 @@
 """
-AI Cinematic STEM Animator — Streamlit app
-============================================
+AI Cinematic STEM Animator — Streamlit app (multi-provider edition)
+=====================================================================
 Pipeline:
   1. Ingest question (text / image / PDF, incl. scanned PDFs via page-rasterization)
-  2. Gemini writes a STORYBOARD (list of scenes with description + target duration)
-  3. Each scene's Manim code is generated INDIVIDUALLY (small, focused context ->
-     far fewer hallucinations/truncations than one giant scene)
+  2. An LLM writes a STORYBOARD (list of scenes with description + target duration)
+  3. Each scene's Manim code is generated INDIVIDUALLY (small, focused context)
   4. Each scene is self-healed up to N times: syntax check -> render -> ACTUAL
-     duration check via ffprobe (this is what fixes the "1 second" problem —
-     we don't just trust the LLM's promise of duration, we measure it)
+     duration check via ffprobe
   5. Scenes are concatenated with real crossfade transitions (ffmpeg xfade)
   6. Optional cinematic color grade + vignette + letterbox + background music
 
-Requirements (put in requirements.txt / install manually):
+MULTI-PROVIDER + AUTO-FALLBACK
+-------------------------------
+Configure any of Gemini / Groq / OpenAI in the sidebar (you only need ONE,
+but configuring more than one gives you automatic fallback). Each provider
+gets a priority number (1 = tried first). Every LLM call in the pipeline
+goes through a router: it tries providers in priority order and falls
+through to the next one automatically if a provider is rate-limited, out
+of quota, or its SDK isn't installed. You always see in the UI which
+provider actually served each call.
+
+Vision-dependent steps (reading a question out of an image or a scanned
+PDF page) automatically skip any configured provider that doesn't support
+vision for that call, even if it's higher priority — so put a vision-
+capable model in your list if you plan to use image/PDF input.
+
+Requirements (pip):
     streamlit
-    google-genai
+    google-genai        # only needed if you use Gemini
+    groq                 # only needed if you use Groq
+    openai               # only needed if you use OpenAI
     pillow
     pdfplumber
-    pymupdf          # fallback: rasterize scanned/image-only PDF pages
+    pymupdf              # fallback: rasterize scanned/image-only PDF pages
 Also required on the SYSTEM (not pip):
-    manim             (pip install manim, plus its system deps: pango/cairo)
-    ffmpeg            (must be on PATH — used for concat, grading, duration probing)
+    manim                (pip install manim, plus its system deps: pango/cairo)
+    ffmpeg                (must be on PATH)
 
 Run:
     streamlit run cinematic_animator_app.py
 """
 
+import base64
 import io
 import json
 import os
 import py_compile
-import random
 import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import streamlit as st
 from PIL import Image
-from google import genai
 
 # ----------------------------------------------------------------------------
 # Page setup
@@ -49,33 +62,203 @@ st.set_page_config(page_title="AI Cinematic STEM Animator", page_icon="🎬", la
 st.title("🎬 AI Cinematic STEM Animator")
 st.caption(
     "Text / image / PDF → storyboard → multi-scene Manim render → cinematic cut. "
-    "Manim can't be photoreal (it's a vector engine, not a ray-tracer) — this "
-    "pipeline pushes it to its cinematic ceiling: depth, glow, camera motion, "
-    "grading, music, crossfades."
+    "Configure one or more AI providers in the sidebar — if your primary hits a "
+    "rate limit, the app automatically falls back to the next one."
 )
 
-# ----------------------------------------------------------------------------
-# Sidebar configuration
-# ----------------------------------------------------------------------------
-st.sidebar.header("⚙️ Configuration")
-api_key = st.sidebar.text_input("Gemini API Key:", type="password")
+# ============================================================================
+# Provider layer — Gemini / Groq / OpenAI behind one interface, with fallback
+# ============================================================================
+class ProviderError(Exception):
+    """Raised for anything that should trigger falling back to the next
+    provider: rate limit, quota exhausted, missing SDK, no vision support
+    for a vision-required call, or a hard API error."""
 
-MODEL_OPTIONS = [
-    "gemini-3.5-flash",        # GA, fastest current flagship-tier flash
-    "gemini-3.1-pro-preview",  # strongest reasoning, best for dense/tricky problems
-    "gemini-2.5-pro",          # stable fallback (retires 16 Oct 2026)
-    "gemini-2.5-flash",        # stable fallback (retires 16 Oct 2026)
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(s in msg for s in ["429", "rate limit", "rate_limit", "resource_exhausted", "quota"])
+
+
+def pil_to_data_url(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
+def call_gemini(api_key: str, model: str, system_prompt: Optional[str], user_parts: list) -> str:
+    try:
+        from google import genai
+    except ImportError:
+        raise ProviderError("google-genai SDK not installed (pip install google-genai)")
+    try:
+        client = genai.Client(api_key=api_key)
+        contents = ([system_prompt] if system_prompt else []) + list(user_parts)
+        resp = client.models.generate_content(model=model, contents=contents)
+        return resp.text
+    except ProviderError:
+        raise
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            raise ProviderError(f"Gemini rate/quota limit: {e}")
+        raise ProviderError(f"Gemini error: {e}")
+
+
+def _build_chat_messages(system_prompt: Optional[str], user_parts: list, supports_vision: bool):
+    text_chunks, image_blocks = [], []
+    for part in user_parts:
+        if isinstance(part, Image.Image):
+            if not supports_vision:
+                raise ProviderError("This model has no vision support — needed for an image/PDF-page input.")
+            image_blocks.append({"type": "image_url", "image_url": {"url": pil_to_data_url(part)}})
+        else:
+            text_chunks.append(str(part))
+    joined_text = "\n\n".join(text_chunks)
+    user_content = (image_blocks + [{"type": "text", "text": joined_text}]) if image_blocks else joined_text
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def call_groq(api_key: str, model: str, system_prompt: Optional[str], user_parts: list, supports_vision: bool) -> str:
+    try:
+        from groq import Groq
+    except ImportError:
+        raise ProviderError("groq SDK not installed (pip install groq)")
+    messages = _build_chat_messages(system_prompt, user_parts, supports_vision)
+    try:
+        client = Groq(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages)
+        return resp.choices[0].message.content
+    except ProviderError:
+        raise
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            raise ProviderError(f"Groq rate/quota limit: {e}")
+        raise ProviderError(f"Groq error: {e}")
+
+
+def call_openai(api_key: str, model: str, system_prompt: Optional[str], user_parts: list, supports_vision: bool) -> str:
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ProviderError("openai SDK not installed (pip install openai)")
+    messages = _build_chat_messages(system_prompt, user_parts, supports_vision)
+    try:
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages)
+        return resp.choices[0].message.content
+    except ProviderError:
+        raise
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            raise ProviderError(f"OpenAI rate/quota limit: {e}")
+        raise ProviderError(f"OpenAI error: {e}")
+
+
+@dataclass
+class ProviderConfig:
+    name: str  # "Gemini" | "Groq" | "OpenAI"
+    api_key: str
+    model: str
+    supports_vision: bool
+    priority: int
+
+
+class LLMRouter:
+    """Tries providers in priority order, falling through automatically on
+    rate limits / quota errors / missing vision support / missing SDK."""
+
+    def __init__(self, providers: list):
+        self.providers = sorted(providers, key=lambda p: p.priority)
+
+    def generate(self, system_prompt: Optional[str], user_parts: list,
+                 need_vision: bool = False, log=None) -> tuple:
+        attempts = []
+        for p in self.providers:
+            if need_vision and not p.supports_vision:
+                attempts.append(f"{p.name}: skipped (no vision support, this step needs it)")
+                continue
+            try:
+                if p.name == "Gemini":
+                    text = call_gemini(p.api_key, p.model, system_prompt, user_parts)
+                elif p.name == "Groq":
+                    text = call_groq(p.api_key, p.model, system_prompt, user_parts, p.supports_vision)
+                else:
+                    text = call_openai(p.api_key, p.model, system_prompt, user_parts, p.supports_vision)
+                if log:
+                    log(f"✓ served by **{p.name}** ({p.model})")
+                return text, p.name
+            except ProviderError as e:
+                attempts.append(f"{p.name}: {e}")
+                if log:
+                    log(f"⚠️ {p.name} unavailable ({e}) — trying next provider…")
+                continue
+        raise RuntimeError("All configured providers failed for this call:\n" + "\n".join(attempts))
+
+
+# ----------------------------------------------------------------------------
+# Sidebar: provider configuration
+# ----------------------------------------------------------------------------
+st.sidebar.header("🔑 AI Providers")
+st.sidebar.caption(
+    "Configure at least one. Configuring more than one enables automatic "
+    "fallback — set the priority (1 = tried first) for each."
+)
+
+GEMINI_MODEL_OPTIONS = ["gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+GROQ_MODEL_OPTIONS = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # vision-capable
 ]
-model_name = st.sidebar.selectbox(
-    "Gemini model", MODEL_OPTIONS,
-    help="3.5-flash = fast & cheap. 3.1-pro-preview = best reasoning for hard/cramped "
-         "questions. The 2.5 models are stable but Google retires them 16 Oct 2026.",
-)
+GROQ_VISION_MODELS = {"meta-llama/llama-4-scout-17b-16e-instruct"}
 
+with st.sidebar.expander("Gemini", expanded=True):
+    gemini_key = st.text_input("API Key", type="password", key="gemini_key")
+    gemini_model = st.selectbox("Model", GEMINI_MODEL_OPTIONS, key="gemini_model")
+    gemini_priority = st.number_input("Priority (1 = tried first)", 1, 3, 1, key="gemini_priority")
+
+with st.sidebar.expander("Groq"):
+    groq_key = st.text_input("API Key", type="password", key="groq_key")
+    groq_model = st.selectbox("Model", GROQ_MODEL_OPTIONS, key="groq_model",
+                               help="llama-4-scout supports vision; the rest are text-only.")
+    groq_priority = st.number_input("Priority", 1, 3, 2, key="groq_priority")
+
+with st.sidebar.expander("OpenAI"):
+    openai_key = st.text_input("API Key", type="password", key="openai_key")
+    openai_model = st.text_input(
+        "Model", value="gpt-4o-mini", key="openai_model",
+        help="OpenAI's model names change often — use whatever ID your account currently has access to.",
+    )
+    openai_vision = st.checkbox("This model supports vision", value=True, key="openai_vision")
+    openai_priority = st.number_input("Priority", 1, 3, 3, key="openai_priority")
+
+providers = []
+if gemini_key:
+    providers.append(ProviderConfig("Gemini", gemini_key, gemini_model, True, gemini_priority))
+if groq_key:
+    providers.append(ProviderConfig("Groq", groq_key, groq_model, groq_model in GROQ_VISION_MODELS, groq_priority))
+if openai_key:
+    providers.append(ProviderConfig("OpenAI", openai_key, openai_model, openai_vision, openai_priority))
+
+if providers:
+    order_str = " → ".join(f"{p.name}" for p in sorted(providers, key=lambda p: p.priority))
+    st.sidebar.success(f"Fallback order: {order_str}")
+else:
+    st.sidebar.warning("No provider configured yet.")
+
+st.sidebar.divider()
+st.sidebar.header("⚙️ Render Configuration")
 quality = st.sidebar.selectbox("Render Quality", ["Low (-ql, fast draft)", "Medium (-qm)", "High (-qh, 1080p60)"])
 quality_flag = "-ql" if "Low" in quality else ("-qm" if "Medium" in quality else "-qh")
 
-target_duration = st.sidebar.slider("Target total duration (seconds)", 0, 120, 45, step=5)
+target_duration = st.sidebar.slider("Target total duration (seconds)", 20, 120, 45, step=5)
 style_theme = st.sidebar.selectbox(
     "Visual theme",
     ["Deep Space (navy/cyan glow)", "Blueprint (dark slate/amber)", "Aurora (violet/teal gradient)"],
@@ -121,14 +304,11 @@ else:
 # Ingestion helpers
 # ============================================================================
 def extract_pdf_pages(raw_bytes: bytes, max_pages: int = 5):
-    """Return list of (page_text, PIL.Image or None). Falls back to
-    rasterizing a page to an image when it has ~no extractable text
-    (i.e. it's a scan/screenshot embedded in the PDF)."""
     pages = []
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages[:max_pages]):
+            for page in pdf.pages[:max_pages]:
                 text = (page.extract_text() or "").strip()
                 pages.append((text, None))
     except Exception:
@@ -149,39 +329,39 @@ def extract_pdf_pages(raw_bytes: bytes, max_pages: int = 5):
     return pages
 
 
-def build_question_context(client: genai.Client, model: str) -> str:
-    """Normalize whatever the user gave us into one rich text description
-    Gemini can use to write a storyboard."""
-    prompt = (
-        "You are reading a STEM question for a student. Extract and restate: "
-        "(1) the exact problem statement, (2) all given data/values, (3) what "
-        "is being asked, (4) the core concept(s) involved, (5) the key physical "
-        "or mathematical objects that must appear in a 3D visualization "
-        "(e.g. vectors, trajectories, surfaces, fields, geometric solids). "
-        "Be precise and complete — this will drive an animation storyboard."
-    )
+EXTRACTION_PROMPT = (
+    "You are reading a STEM question for a student. Extract and restate: "
+    "(1) the exact problem statement, (2) all given data/values, (3) what "
+    "is being asked, (4) the core concept(s) involved, (5) the key physical "
+    "or mathematical objects that must appear in a 3D visualization "
+    "(e.g. vectors, trajectories, surfaces, fields, geometric solids). "
+    "Be precise and complete — this will drive an animation storyboard."
+)
+
+
+def build_question_context(router: LLMRouter, log) -> str:
     if question_text.strip():
         return f"QUESTION (typed by student):\n{question_text.strip()}"
 
     if question_image is not None:
-        resp = client.models.generate_content(model=model, contents=[prompt, question_image])
-        return f"QUESTION (extracted from image):\n{resp.text.strip()}"
+        text, provider = router.generate(EXTRACTION_PROMPT, [question_image], need_vision=True, log=log)
+        return f"QUESTION (extracted from image via {provider}):\n{text.strip()}"
 
     if pdf_bytes is not None:
         pages = extract_pdf_pages(pdf_bytes)
-        contents = [prompt]
-        combined_text = []
+        parts, combined_text, has_image = [], [], False
         for text, img in pages:
             if text:
                 combined_text.append(text)
             if img is not None:
-                contents.append(img)
+                parts.append(img)
+                has_image = True
         if combined_text:
-            contents.append("Extracted PDF text:\n" + "\n---\n".join(combined_text))
-        if len(contents) == 1:
+            parts.append("Extracted PDF text:\n" + "\n---\n".join(combined_text))
+        if not parts:
             raise ValueError("Could not extract any content from the PDF.")
-        resp = client.models.generate_content(model=model, contents=contents)
-        return f"QUESTION (extracted from PDF):\n{resp.text.strip()}"
+        text, provider = router.generate(EXTRACTION_PROMPT, parts, need_vision=has_image, log=log)
+        return f"QUESTION (extracted from PDF via {provider}):\n{text.strip()}"
 
     raise ValueError("No input provided.")
 
@@ -223,14 +403,14 @@ Rules:
 """
 
 
-def generate_storyboard(client: genai.Client, model: str, context: str, target_duration: int) -> list:
+def generate_storyboard(router: LLMRouter, context: str, target_duration: int, log) -> list:
     prompt = STORYBOARD_SYSTEM_PROMPT.format(target_duration=target_duration)
-    resp = client.models.generate_content(model=model, contents=[prompt, context])
-    data = json.loads(sanitize_json(resp.text))
+    text, provider = router.generate(prompt, [context], need_vision=False, log=log)
+    data = json.loads(sanitize_json(text))
     scenes = data["scenes"]
     if not scenes:
         raise ValueError("Storyboard came back empty.")
-    return scenes
+    return scenes, provider
 
 
 # ============================================================================
@@ -257,8 +437,7 @@ HARD OUTPUT REQUIREMENTS:
      reveals (lag_ratio), or an extra explanatory beat. Do not pad with a
      single long self.wait() — pad with actual staged animation.
 
-CINEMATIC VISUAL LANGUAGE (use these to make it look premium, not like a
-bare-bones diagram):
+CINEMATIC VISUAL LANGUAGE:
 - Background: fill with the scene's background color {bg_color} and add a
   sparse starfield/particle field — a VGroup of 40-80 small Dots (radius
   0.01-0.03) at random positions with random low opacities (0.1-0.4),
@@ -288,8 +467,8 @@ Return ONLY the Python code.
 """
 
 
-def generate_scene_code(client: genai.Client, model: str, scene: dict, palette: dict,
-                         continuity_note: str, min_duration: float) -> str:
+def generate_scene_code(router: LLMRouter, scene: dict, palette: dict,
+                         continuity_note: str, min_duration: float, log) -> tuple:
     prompt = SCENE_SYSTEM_PROMPT.format(
         min_duration=round(min_duration, 1),
         bg_color=palette["bg"], primary_color=palette["primary"],
@@ -301,14 +480,11 @@ def generate_scene_code(client: genai.Client, model: str, scene: dict, palette: 
         f"TARGET DURATION: {scene['duration_seconds']} seconds\n"
         f"DESCRIPTION: {scene['description']}"
     )
-    resp = client.models.generate_content(model=model, contents=[prompt, scene_brief])
-    return sanitize_code(resp.text)
+    text, provider = router.generate(prompt, [scene_brief], need_vision=False, log=log)
+    return sanitize_code(text), provider
 
 
 def estimate_static_duration(code: str) -> float:
-    """Rough heuristic sum of run_time=/self.wait(...) numeric literals,
-    used only as a quick pre-render sanity gate (the real check is ffprobe
-    on the rendered file)."""
     total = 0.0
     for match in re.finditer(r"run_time\s*=\s*([\d.]+)", code):
         total += float(match.group(1))
@@ -332,7 +508,6 @@ class SceneResult:
 
 
 def compile_check(code: str, tmpdir: str) -> Optional[str]:
-    """Returns error string, or None if it compiles cleanly."""
     tmp_path = os.path.join(tmpdir, "syntax_check.py")
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(code)
@@ -367,14 +542,15 @@ def get_video_duration(path: str) -> float:
         return 0.0
 
 
-def render_scene_with_healing(client: genai.Client, model: str, scene: dict, idx: int,
-                               palette: dict, continuity_note: str, quality_flag: str,
+def render_scene_with_healing(router: LLMRouter, scene: dict, idx: int, palette: dict,
+                               continuity_note: str, quality_flag: str,
                                max_attempts: int, status_box) -> SceneResult:
     result = SceneResult(index=idx, title=scene["title"])
     target = float(scene["duration_seconds"])
-    min_acceptable = target * 0.6  # accept if we get at least 60% of target
+    min_acceptable = target * 0.6
 
-    code = generate_scene_code(client, model, scene, palette, continuity_note, target)
+    log = lambda msg: status_box.write(msg)
+    code, provider = generate_scene_code(router, scene, palette, continuity_note, target, log)
     error_feedback = None
 
     for attempt in range(1, max_attempts + 1):
@@ -389,8 +565,8 @@ def render_scene_with_healing(client: genai.Client, model: str, scene: dict, idx
                 f"time must be at least {target:.1f} seconds (explicit run_time "
                 f"and self.wait values). Return ONLY corrected Python code."
             )
-            resp = client.models.generate_content(model=model, contents=[fix_prompt])
-            code = sanitize_code(resp.text)
+            text, provider = router.generate(None, [fix_prompt], need_vision=False, log=log)
+            code = sanitize_code(text)
 
         with tempfile.TemporaryDirectory() as scene_tmp:
             compile_err = compile_check(code, scene_tmp)
@@ -443,7 +619,6 @@ def render_scene_with_healing(client: genai.Client, model: str, scene: dict, idx
                 result.log.append(f"attempt {attempt}: rendered but too short ({actual:.1f}s)")
                 continue
 
-            # success — copy out of the temp dir before it's cleaned up
             persist_dir = tempfile.mkdtemp()
             final_path = os.path.join(persist_dir, f"scene_{idx}.mp4")
             with open(mp4, "rb") as src, open(final_path, "wb") as dst:
@@ -452,7 +627,7 @@ def render_scene_with_healing(client: genai.Client, model: str, scene: dict, idx
             result.video_path = final_path
             result.actual_duration = actual
             result.code = code
-            status_box.write(f"✅ Scene {idx + 1} rendered — {actual:.1f}s")
+            status_box.write(f"✅ Scene {idx + 1} rendered — {actual:.1f}s (code by {provider})")
             return result
 
     status_box.write(f"⚠️ Scene {idx + 1} did not reach target duration after {max_attempts} attempts — using best effort.")
@@ -508,7 +683,7 @@ def apply_cinematic_grade(in_path: str, tmpdir: str) -> str:
     vf = (
         "eq=contrast=1.08:saturation=1.15:brightness=0.01,"
         "vignette=PI/4,"
-        "pad=iw:ih*1.14:0:(oh-ih)/2:black"  # letterbox bars
+        "pad=iw:ih*1.14:0:(oh-ih)/2:black"
     )
     cmd = ["ffmpeg", "-y", "-i", in_path, "-vf", vf, "-c:v", "libx264",
            "-pix_fmt", "yuv420p", out_path]
@@ -535,22 +710,24 @@ def mux_music(video_path: str, music_bytes: bytes, volume: float, tmpdir: str) -
 # Main pipeline
 # ============================================================================
 if st.button("🚀 Generate Cinematic Animation", use_container_width=True):
-    if not api_key:
-        st.error("⚠️ Please enter a valid Gemini API Key in the sidebar.")
+    if not providers:
+        st.error("⚠️ Configure at least one AI provider (Gemini, Groq, or OpenAI) in the sidebar.")
     elif not question_text.strip() and question_image is None and pdf_bytes is None:
         st.error("⚠️ Please provide text, an image, or a PDF.")
     else:
-        client = genai.Client(api_key=api_key)
+        router = LLMRouter(providers)
         output_root = tempfile.mkdtemp()
 
         try:
             with st.status("🧠 Reading the question…", expanded=True) as status:
-                context = build_question_context(client, model_name)
+                context = build_question_context(router, log=lambda m: status.write(m))
                 st.write(context[:600] + ("…" if len(context) > 600 else ""))
                 status.update(label="🎬 Writing storyboard…")
 
-                scenes = generate_storyboard(client, model_name, context, target_duration)
-                status.update(label=f"📋 Storyboard: {len(scenes)} scenes", state="running")
+                scenes, sb_provider = generate_storyboard(
+                    router, context, target_duration, log=lambda m: status.write(m)
+                )
+                status.update(label=f"📋 Storyboard: {len(scenes)} scenes (by {sb_provider})", state="running")
                 for i, sc in enumerate(scenes):
                     st.write(f"**Scene {i + 1}: {sc['title']}** — ~{sc['duration_seconds']}s")
 
@@ -559,7 +736,7 @@ if st.button("🚀 Generate Cinematic Animation", use_container_width=True):
             for i, sc in enumerate(scenes):
                 box = st.status(f"Rendering scene {i + 1}/{len(scenes)}: {sc['title']}", expanded=True)
                 res = render_scene_with_healing(
-                    client, model_name, sc, i, palette, continuity_note,
+                    router, sc, i, palette, continuity_note,
                     quality_flag, max_heal_attempts, box,
                 )
                 scene_results.append(res)
