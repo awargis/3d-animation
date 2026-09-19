@@ -90,7 +90,7 @@ st.caption(
 # Constants
 # ============================================================================
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 DEFAULT_MAX_PDF_PAGES = 6
 DEFAULT_PDF_DPI = 180
@@ -1670,45 +1670,91 @@ def find_best_mp4(root: str) -> Optional[str]:
 
 
 def get_video_duration(path: str) -> float:
+    """
+    Read video duration with ffprobe.
+
+    Uses the CSV writer first because some FFmpeg/ffprobe builds reject
+    the older ``default=noprint_wrapper=1:nokey=1`` syntax.
+    """
     if not os.path.isfile(path):
-        return 0.0
-
-    result = run_command(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrapper=1:nokey=1",
-            path,
-        ],
-        timeout=30,
-    )
-
-    if result.returncode != 0:
-        raise RenderError(
-            "ffprobe could not inspect the video:\n"
-            + result.stderr[-1500:]
-        )
+        raise RenderError(f"Video file does not exist: {path}")
 
     try:
-        duration = float(result.stdout.strip())
-    except ValueError as exc:
-        raise RenderError(
-            f"ffprobe returned an invalid duration: {result.stdout!r}"
-        ) from exc
+        if os.path.getsize(path) < 1024:
+            raise RenderError(f"Video file is empty or suspiciously small: {path}")
+    except OSError as exc:
+        raise RenderError(f"Could not inspect video file: {path}") from exc
 
-    if duration <= 0:
-        raise RenderError("Video duration is zero or negative.")
+    commands = [
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            path,
+        ],
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            path,
+        ],
+    ]
 
-    return duration
+    errors: list[str] = []
+
+    for command in commands:
+        try:
+            result = run_command(command, timeout=30)
+        except RenderError as exc:
+            errors.append(str(exc))
+            continue
+
+        if result.returncode != 0:
+            errors.append(
+                (result.stderr or result.stdout or "ffprobe returned no diagnostic")[-2000:]
+            )
+            continue
+
+        raw = (result.stdout or "").strip()
+
+        if raw and not raw.startswith("{"):
+            try:
+                duration = float(raw.splitlines()[0].strip())
+                if duration > 0:
+                    return duration
+            except ValueError:
+                pass
+
+        if raw.startswith("{"):
+            try:
+                payload = json.loads(raw)
+                duration = float(payload.get("format", {}).get("duration"))
+                if duration > 0:
+                    return duration
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                pass
+
+        errors.append(f"ffprobe returned an unusable duration: {raw[:500]!r}")
+
+    raise RenderError(
+        "ffprobe could not inspect the video. "
+        "Tried compatible CSV and JSON output modes.\n"
+        + "\n---\n".join(errors[-3:])[-3000:]
+    )
 
 
 def verify_video_file(path: str) -> dict[str, Any]:
+    """Validate that a generated video is readable and has a video stream."""
     if not os.path.isfile(path):
-        raise RenderError("Video file does not exist.")
+        raise RenderError(f"Video file does not exist: {path}")
+
+    try:
+        file_size = os.path.getsize(path)
+    except OSError as exc:
+        raise RenderError(f"Could not stat video file: {path}") from exc
+
+    if file_size < 1024:
+        raise RenderError(f"Video file is empty or suspiciously small: {path}")
 
     result = run_command(
         [
@@ -1716,7 +1762,8 @@ def verify_video_file(path: str) -> dict[str, Any]:
             "-v",
             "error",
             "-show_entries",
-            "format=duration,size,format_name",
+            "format=duration,size,format_name:"
+            "stream=index,codec_type,width,height,r_frame_rate,codec_name",
             "-of",
             "json",
             path,
@@ -1727,21 +1774,52 @@ def verify_video_file(path: str) -> dict[str, Any]:
     if result.returncode != 0:
         raise RenderError(
             "Video validation failed:\n"
-            + result.stderr[-1500:]
+            + (result.stderr or result.stdout)[-2500:]
         )
 
     try:
         data = json.loads(result.stdout)
-        fmt = data.get("format", {})
-        return {
-            "duration": float(fmt.get("duration", 0)),
-            "size": int(fmt.get("size", 0)),
-            "format": fmt.get("format_name", ""),
-        }
-    except Exception as exc:
+    except json.JSONDecodeError as exc:
         raise RenderError(
-            "Could not parse ffprobe video metadata."
+            "ffprobe returned invalid JSON while validating the video."
         ) from exc
+
+    fmt = data.get("format") or {}
+    streams = data.get("streams") or []
+    video_streams = [
+        stream for stream in streams
+        if stream.get("codec_type") == "video"
+    ]
+
+    if not video_streams:
+        raise RenderError("ffprobe found no video stream in the generated file.")
+
+    try:
+        duration = float(fmt.get("duration", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise RenderError(
+            f"ffprobe returned an invalid duration: {fmt.get('duration')!r}"
+        ) from exc
+
+    if duration <= 0:
+        raise RenderError(f"ffprobe reported a non-positive duration: {duration}")
+
+    stream = video_streams[0]
+
+    try:
+        reported_size = int(fmt.get("size", 0) or 0)
+    except (TypeError, ValueError):
+        reported_size = file_size
+
+    return {
+        "duration": duration,
+        "size": reported_size or file_size,
+        "format": fmt.get("format_name", ""),
+        "video_codec": stream.get("codec_name", ""),
+        "width": int(stream.get("width", 0) or 0),
+        "height": int(stream.get("height", 0) or 0),
+        "fps": stream.get("r_frame_rate", ""),
+    }
 
 
 # ============================================================================
@@ -2303,6 +2381,16 @@ def mux_music(
 # Main pipeline
 # ============================================================================
 
+def get_tool_version(executable: str) -> str:
+    """Return a short version string for a system executable."""
+    try:
+        result = run_command([executable, "-version"], timeout=15)
+        output = (result.stdout or result.stderr or "").strip()
+        return output.splitlines()[0] if output else "version unavailable"
+    except Exception as exc:
+        return f"version unavailable ({exc})"
+
+
 def render_dependency_warning() -> None:
     missing = check_system_dependencies()
 
@@ -2313,6 +2401,11 @@ def render_dependency_warning() -> None:
             + ". The app can still display its UI, but rendering will fail "
               "until the dependency is installed."
         )
+    else:
+        with st.sidebar.expander("🧪 System Diagnostics", expanded=False):
+            st.write(f"FFmpeg: {get_tool_version('ffmpeg')}")
+            st.write(f"ffprobe: {get_tool_version('ffprobe')}")
+            st.write(f"Manim: {get_tool_version('manim')}")
 
 
 render_dependency_warning()
@@ -2679,6 +2772,14 @@ if st.button(
                     "storyboard_provider": storyboard_provider,
                     "planned_duration": target_duration,
                     "actual_duration": round(total_actual, 2),
+                    "final_video_size_bytes": final_info.get("size", 0),
+                    "final_video_format": final_info.get("format", ""),
+                    "final_video_codec": final_info.get("video_codec", ""),
+                    "final_video_resolution": (
+                        f"{final_info.get('width', 0)}x"
+                        f"{final_info.get('height', 0)}"
+                    ),
+                    "final_video_fps": final_info.get("fps", ""),
                     "successful_scenes": successful_count,
                     "total_scenes": len(scenes),
                     "quality": quality_label,
