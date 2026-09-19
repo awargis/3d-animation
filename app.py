@@ -288,8 +288,7 @@ def normalize_json_text(raw_text: str) -> str:
 def parse_json_object(raw_text: str, label: str) -> dict[str, Any]:
     cleaned = normalize_json_text(raw_text)
     try:
-        # Instead of json.loads(cleaned):
-data = json.loads(cleaned)
+data = json.loads(cleaned):
     except json.JSONDecodeError as exc:
         raise ValidationError(
             f"{label} returned invalid JSON: {exc.msg} at character {exc.pos}."
